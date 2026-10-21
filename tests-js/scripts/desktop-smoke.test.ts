@@ -288,23 +288,35 @@ test.runIf(process.platform === 'linux')('the detached gateway owner named by th
     }
 
     fs.writeFileSync(pidFile, JSON.stringify(record))
+    const commit = 'a'.repeat(40)
+    // The owner's own state carries its code identity only for its own pid.
+    fs.writeFileSync(path.join(home, 'gateway_state.json'), JSON.stringify({ pid: process.pid, code_sha: commit }))
+    expect(localBackendProcess(port, child.pid!, home).gatewayCodeSha).toBeUndefined()
+    fs.writeFileSync(path.join(home, 'gateway_state.json'), JSON.stringify({ pid: child.pid, code_sha: commit }))
     const backend = localBackendProcess(port, child.pid!, home)
     expect(backend.pid).toBe(child.pid)
     expect(backend.ownership).toBe('gateway-owner')
+    expect(backend.gatewayCodeSha).toBe(commit)
     // Ownership does not waive the installed-tree provenance check.
     expect(() => assertBackendOrigin(backend, home, 'bundled')).toThrow('agent-payload')
 
-    // Where the platform hides cwd/env (Windows), the app's report of its root vouches for
-    // the gateway owner its own home names, exactly as for its child, never for a ledger entry.
+    // Where the platform hides cwd/env (Windows), the owner is not the app's descendant and
+    // another installation sharing the home could have started it: the app's root vouches
+    // only when the owner's own code identity is the installed commit. Never for a ledger entry.
     const root = path.join(home, 'hermes-agent')
     fs.mkdirSync(root)
 
     const hidden = { pid: child.pid!, parentPid: 1, executable: path.join(home, 'python.exe'),
       command: `"${path.join(home, 'python.exe')}" "-m" "hermes_cli.main" --profile default gateway run --quiet` }
 
-    expect(() => assertBackendOrigin({ ...hidden, ownership: 'gateway-owner' }, root, 'source', { appReportedRoot: root })).not.toThrow()
-    expect(() => assertBackendOrigin({ ...hidden, ownership: 'gateway-owner' }, root, 'source')).toThrow('source tree')
-    expect(() => assertBackendOrigin({ ...hidden, ownership: 'host-ledger' }, root, 'source', { appReportedRoot: root })).toThrow('source tree')
+    const owner = { ...hidden, ownership: 'gateway-owner' as const, gatewayCodeSha: commit }
+    const vouched = { appReportedRoot: root, installedCommit: commit }
+
+    expect(() => assertBackendOrigin(owner, root, 'source', vouched)).not.toThrow()
+    expect(() => assertBackendOrigin(owner, root, 'source', { ...vouched, installedCommit: 'b'.repeat(40) })).toThrow('source tree')
+    expect(() => assertBackendOrigin({ ...owner, gatewayCodeSha: undefined }, root, 'source', vouched)).toThrow('source tree')
+    expect(() => assertBackendOrigin(owner, root, 'source', { installedCommit: commit })).toThrow('source tree')
+    expect(() => assertBackendOrigin({ ...owner, ownership: 'host-ledger' }, root, 'source', vouched)).toThrow('source tree')
   } finally {
     child.kill()
     await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) })

@@ -26,12 +26,16 @@ export interface NativeProcess {
 /** The identified listener, with how it was tied to this app (ancestry, this home's ledger, or this home's gateway owner). */
 export interface BackendProcess extends NativeProcess {
   ownership: 'child' | 'host-ledger' | 'gateway-owner'
+  /** For a gateway owner: the `code_sha` that process stamped into its own `gateway_state.json`. */
+  gatewayCodeSha?: string
 }
 
 /** What the caller already knows about the app that owns this listener. */
 export interface OriginEvidence {
   /** The root the app itself reported resolving, from its own UI/identity channel. */
   appReportedRoot?: string
+  /** The commit the expected installation records (`readInstallationCommit`). */
+  installedCommit?: string
 }
 
 function nativeText(command: string, args: string[]): string {
@@ -204,8 +208,8 @@ function gatewayStartMatches(pid: number, recorded: number | null | undefined): 
  * owner is detached on purpose (`gateway_runtime_start.py::spawn_unmanaged_gateway`), so it is never
  * an Electron descendant. A served profile's owner is the machine root's multiplexer.
  */
-function gatewayOwnerPids(processes: NativeProcess[], homes: string[]): number[] {
-  return [...new Set(homes)].flatMap((home: string): number[] => {
+function gatewayOwnerPids(processes: NativeProcess[], homes: string[]): Map<number, string> {
+  return new Map([...new Set(homes)].flatMap((home: string): Array<[number, string]> => {
     let parsed: z.infer<typeof gatewayPidRecord>
 
     try {
@@ -216,8 +220,21 @@ function gatewayOwnerPids(processes: NativeProcess[], homes: string[]): number[]
 
     const live = processes.some((candidate: NativeProcess): boolean => candidate.pid === parsed.pid)
 
-    return live && gatewayStartMatches(parsed.pid, parsed.start_time) ? [parsed.pid] : []
-  })
+    return live && gatewayStartMatches(parsed.pid, parsed.start_time) ? [[parsed.pid, home]] : []
+  }))
+}
+
+const gatewayStateRecord = z.object({ pid: z.number().int().positive(), code_sha: z.string().min(7).nullable().optional() })
+
+/** The commit a gateway owner says it imported (`gateway/status.py` stamps it), only when the state names that pid. */
+function gatewayOwnerCodeSha(home: string, pid: number): string | undefined {
+  try {
+    const state = gatewayStateRecord.parse(JSON.parse(fs.readFileSync(path.join(home, 'gateway_state.json'), 'utf8')))
+
+    return state.pid === pid ? state.code_sha ?? undefined : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** Identify the actual listener, not a healthy helper or a command recorded before spawn. */
@@ -233,7 +250,7 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   // its own child. Registration is only a candidate: the OS listener and the
   // caller's existing installed-tree checks must independently agree.
   let registered: number[] = []
-  let gatewayOwners: number[] = []
+  let gatewayOwners = new Map<number, string>()
 
   if (hermesHome) {
     // The product writes one machine-root ledger for every profile, and the app
@@ -262,7 +279,7 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   }
 
   const candidates = processes.filter(candidate => children.includes(candidate) || registered.includes(candidate.pid)
-    || gatewayOwners.includes(candidate.pid))
+    || gatewayOwners.has(candidate.pid))
 
   let pids: number[]
 
@@ -282,10 +299,16 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
     throw new Error(`Expected one Desktop-owned, ledger-registered or gateway-owner backend listener on port ${port}; found ${matches.length}`)
   }
 
+  const ownerHome = gatewayOwners.get(matches[0].pid)
+
   const ownership: BackendProcess['ownership'] = children.includes(matches[0]) ? 'child'
-    : gatewayOwners.includes(matches[0].pid) ? 'gateway-owner' : 'host-ledger'
+    : ownerHome !== undefined ? 'gateway-owner' : 'host-ledger'
 
   const backend: BackendProcess = { ...matches[0], ownership }
+
+  if (ownership === 'gateway-owner' && ownerHome !== undefined) {
+    backend.gatewayCodeSha = gatewayOwnerCodeSha(ownerHome, backend.pid)
+  }
 
   if (process.platform === 'linux') {
     backend.executable = fs.readlinkSync(`/proc/${backend.pid}/exe`)
@@ -310,18 +333,22 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
 // module-launched backend there can never name its tree in argv (Windows: the venv
 // launcher hands the interpreter over as a system python). When the listener is a
 // descendant of the app, and the caller has already asserted the root that app
-// reported resolving, those two facts together are the evidence. The same holds for
-// the gateway owner the app's own home names in `gateway.pid`: the app started or
-// adopted it through `hermes gateway ensure` from that root, and the chat smoke still
-// checks the commit it runs. A ledger-registered host backend is tied to neither, so
-// it must carry its own argv/env/cwd evidence. Requiring the process evidence to be
-// absent keeps this from loosening a platform that can read one.
+// reported resolving, those two facts together are the evidence. The gateway owner
+// the app's home names in `gateway.pid` is not the app's descendant and another
+// installation sharing that home could have started it, so it must also vouch for
+// itself: the `code_sha` it stamped into `gateway_state.json` is the installed commit.
+// A ledger-registered host backend is tied to neither, so it must carry its own
+// argv/env/cwd evidence. Requiring the process evidence to be absent keeps this from
+// loosening a platform that can read one.
 function appVouchesForBackend(backend: BackendProcess, evidence: OriginEvidence,
   sameTree: (value?: string) => boolean): boolean {
   const processEvidenceUnreadable = backend.cwd === undefined
     && backend.pythonPath === undefined && backend.virtualEnv === undefined
 
-  return processEvidenceUnreadable && (backend.ownership === 'child' || backend.ownership === 'gateway-owner')
+  const ownedByApp = backend.ownership === 'child' || (backend.ownership === 'gateway-owner'
+    && backend.gatewayCodeSha !== undefined && backend.gatewayCodeSha === evidence.installedCommit)
+
+  return processEvidenceUnreadable && ownedByApp
     && evidence.appReportedRoot !== undefined && sameTree(evidence.appReportedRoot)
 }
 
