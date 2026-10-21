@@ -73,6 +73,8 @@ try:
     result['breakaway_spawn'] = 'ok'
 except OSError as exc:
     result['breakaway_spawn'] = '%s winerror=%s' % (type(exc).__name__, getattr(exc, 'winerror', None))
+import sys
+result['exe'] = sys.executable
 print('BREAKAWAY-PROBE ' + json.dumps(result))
 '@
 
@@ -270,11 +272,18 @@ function Find-BreakawayLaunch([string]$Work, [string]$Python) {
     if ($script:BreakawayLaunch) { return $script:BreakawayLaunch }
     $probe = Join-Path $Work 'breakaway-probe.py'
     $script:BreakawayProbe | Set-Content -LiteralPath $probe -Encoding ascii
+    # A venv python.exe is a launcher that holds the real interpreter in its own job
+    # (KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK), and breakaway is judged against the
+    # immediate job only. The gateway's python sits directly in the context's job
+    # (libuv's jobs are silent-breakaway too), so probe with the real interpreter.
+    $real = (& $Python -c "import sys; print(getattr(sys, '_base_executable', sys.executable))" | Select-Object -Last 1).Trim()
+    Write-Host "breakaway probe interpreter: $real (from $Python)"
     $verdicts = [ordered]@{}
-    $verdicts['step'] = (& $Python $probe 2>&1 | ForEach-Object { "$_" }) -join ' '
+    $verdicts['step-launcher'] = (& $Python $probe 2>&1 | ForEach-Object { "$_" }) -join ' '
+    $verdicts['step'] = (& $real $probe 2>&1 | ForEach-Object { "$_" }) -join ' '
     foreach ($via in @('task', 'wmi', 'explorer')) {
         try {
-            Invoke-OutsideRunnerJob "probe-$via" $Work $Python @($probe) -TimeoutMinutes 2 -Via $via -Quiet | Out-Null
+            Invoke-OutsideRunnerJob "probe-$via" $Work $real @($probe) -TimeoutMinutes 2 -Via $via -Quiet | Out-Null
             $verdicts[$via] = (Get-Content -LiteralPath (Join-Path $Work "outside-job-probe-$via\output.log") -Encoding UTF8) -join ' | '
         } catch {
             $verdicts[$via] = "launch failed: $_"
