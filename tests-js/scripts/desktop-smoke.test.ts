@@ -387,7 +387,7 @@ test('OLD update-window source provenance carries its verified app identity to t
     fs.mkdirSync(other, { recursive: true })
 
     // As `localBackendProcess` reports a listener that descends from the app.
-    const backend = { pid: 2, parentPid: 1, executable: path.join(home, 'python.exe'), ownership: 'child',
+    const backend = { pid: 2, parentPid: 1, executable: path.join(home, 'python.exe'), ownership: 'child' as const,
       command: `"${path.join(home, 'python.exe')}" -m hermes_cli.main dashboard --port 0` }
 
     expect((): void => {
@@ -396,6 +396,19 @@ test('OLD update-window source provenance carries its verified app identity to t
     expect((): void => {
       assertUpdateWindowBackendOrigin(backend, { hermesRoot: other }, root, 'source')
     }).toThrow('resolved another source installation')
+
+    // The detached gateway owner is approved only when its own code identity is the installed commit.
+    const commit = 'c'.repeat(40)
+
+    const owner = { ...backend, ownership: 'gateway-owner' as const, gatewayCodeSha: commit,
+      command: `"${path.join(home, 'python.exe')}" -m hermes_cli.main --profile default gateway run --quiet` }
+
+    expect((): void => {
+      assertUpdateWindowBackendOrigin(owner, { hermesRoot: root }, root, 'source', commit)
+    }).not.toThrow()
+    expect((): void => {
+      assertUpdateWindowBackendOrigin(owner, { hermesRoot: root }, root, 'source', 'd'.repeat(40))
+    }).toThrow('source tree')
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })
 
