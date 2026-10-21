@@ -97,6 +97,11 @@ try {
     }
     "outside-job context: session $((Get-Process -Id $PID).SessionId); chain $($chain -join ' <- ')" |
         Set-Content -LiteralPath $spec.log -Encoding UTF8
+    if ($spec.job) {
+        Add-Type -Path $spec.job
+        [HermesE2EJob]::Enter()
+        "outside-job: wrapper entered a nested job with BREAKAWAY_OK" | Add-Content -LiteralPath $spec.log -Encoding UTF8
+    }
     foreach ($entry in $spec.env.PSObject.Properties) { [Environment]::SetEnvironmentVariable($entry.Name, [string]$entry.Value, 'Process') }
     Set-Location -LiteralPath $spec.cwd
     & $spec.exe @($spec.args) 2>&1 | ForEach-Object { "$_" } | Add-Content -LiteralPath $spec.log -Encoding UTF8
@@ -105,6 +110,43 @@ try {
     "outside-job wrapper failed: $_" | Add-Content -LiteralPath $spec.log -Encoding UTF8
 } finally {
     Set-Content -LiteralPath $spec.exit -Value $code -Encoding ascii
+}
+'@
+
+# Breakaway is judged against the immediate job only, and a child that breaks away
+# stays in the jobs above it. The wrapper can therefore put itself into a fresh job
+# that allows breakaway, nested in the runner's: the gateway python's immediate job
+# is then that one (libuv's own jobs are silent-breakaway), so its detached spawn
+# succeeds and lands in the runner's job, which reaps it with the step.
+$script:NestedJobSource = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class HermesE2EJob {
+    [StructLayout(LayoutKind.Sequential)]
+    struct BASIC {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit;
+        public UIntPtr Affinity; public uint PriorityClass, SchedulingClass;
+    }
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateJobObjectW(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref BASIC info, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    static IntPtr held;
+    public static void Enter() {
+        IntPtr job = CreateJobObjectW(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception();
+        BASIC info = new BASIC();
+        info.LimitFlags = 0x00000800; // JOB_OBJECT_LIMIT_BREAKAWAY_OK
+        if (!SetInformationJobObject(job, 2, ref info, (uint)Marshal.SizeOf(typeof(BASIC)))) throw new Win32Exception();
+        if (!AssignProcessToJobObject(job, GetCurrentProcess())) throw new Win32Exception();
+        held = job;
+    }
 }
 '@
 
@@ -200,6 +242,11 @@ function Start-OutsideJobProcess([string]$Via, [string]$Name, [string]$Exe, [str
             if (-not ('HermesE2EReparent' -as [type])) { Add-Type -TypeDefinition $script:ReparentSource }
             return @{ pid = [HermesE2EReparent]::Start([int]$explorer.ProcessId, $commandLine, $Cwd) }
         }
+        'nested' {
+            # A plain child of this step; the wrapper moves itself into the nested job (spec.job).
+            $child = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $Cwd -WindowStyle Hidden -PassThru
+            return @{ pid = $child.Id }
+        }
         default { throw "unknown outside-job launch '$Via'" }
     }
 }
@@ -241,7 +288,12 @@ function Invoke-OutsideRunnerJob([string]$Name, [string]$Work, [string]$Exe, [st
     Get-ChildItem Env: | ForEach-Object { $environment[$_.Name] = $_.Value }
     $cwd = (Get-Location).ProviderPath
     # ConvertTo-Json -InputObject keeps a one-element args list an array.
-    ConvertTo-Json -Depth 4 -InputObject ([ordered]@{ exe = $Exe; args = [object[]]@($Arguments); cwd = $cwd; env = $environment; log = $log; exit = $exitFile }) |
+    $jobSource = ''
+    if ($Via -eq 'nested') {
+        $jobSource = Join-Path $dir 'nested-job.cs'
+        $script:NestedJobSource | Set-Content -LiteralPath $jobSource -Encoding UTF8
+    }
+    ConvertTo-Json -Depth 4 -InputObject ([ordered]@{ exe = $Exe; args = [object[]]@($Arguments); cwd = $cwd; env = $environment; log = $log; exit = $exitFile; job = $jobSource }) |
         Set-Content -LiteralPath $spec -Encoding UTF8
     $wrapper = Join-Path $dir 'run.ps1'
     $script:OutsideJobWrapper | Set-Content -LiteralPath $wrapper -Encoding UTF8
@@ -281,7 +333,7 @@ function Find-BreakawayLaunch([string]$Work, [string]$Python) {
     $verdicts = [ordered]@{}
     $verdicts['step-launcher'] = (& $Python $probe 2>&1 | ForEach-Object { "$_" }) -join ' '
     $verdicts['step'] = (& $real $probe 2>&1 | ForEach-Object { "$_" }) -join ' '
-    foreach ($via in @('task', 'wmi', 'explorer')) {
+    foreach ($via in @('task', 'wmi', 'explorer', 'nested')) {
         try {
             Invoke-OutsideRunnerJob "probe-$via" $Work $real @($probe) -TimeoutMinutes 2 -Via $via -Quiet | Out-Null
             $verdicts[$via] = (Get-Content -LiteralPath (Join-Path $Work "outside-job-probe-$via\output.log") -Encoding UTF8) -join ' | '
@@ -290,7 +342,7 @@ function Find-BreakawayLaunch([string]$Work, [string]$Python) {
         }
     }
     $chosen = 'step'
-    foreach ($via in @('task', 'wmi', 'explorer')) {
+    foreach ($via in @('task', 'wmi', 'explorer', 'nested')) {
         if ($verdicts[$via] -match '"breakaway_spawn": "ok"') { $chosen = $via; break }
     }
     foreach ($via in $verdicts.Keys) { Write-Host "breakaway probe [$via]: $($verdicts[$via])" }
