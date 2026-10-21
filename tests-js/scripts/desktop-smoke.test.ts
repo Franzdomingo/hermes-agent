@@ -252,6 +252,55 @@ test('a backend bound to the tree by environment needs no root in argv', (): voi
   } finally { fs.rmSync(home, { recursive: true, force: true }) }
 })
 
+test.runIf(process.platform === 'linux')('the detached gateway owner named by this home\'s gateway.pid is the backend Desktop dials', async (): Promise<void> => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-gateway-owner-'))
+  const child = spawn(process.execPath, ['-e', 'const s=require("node:net").createServer();s.listen(0,"127.0.0.1",()=>console.log(s.address().port))'], { stdio: ['ignore', 'pipe', 'pipe'] })
+
+  try {
+    const port = await new Promise<number>((resolve, reject): void => {
+      child.once('error', reject)
+      child.stdout.once('data', (data: Buffer): void => resolve(Number(data.toString().trim())))
+    })
+
+    // `hermes gateway ensure` detaches the owner, so the listener is not under the app
+    // (here the listener stands in as the app, so it has no descendants). Only this home's
+    // live PID record ties it to the app.
+    const startTicks = Number(fs.readFileSync(`/proc/${child.pid}/stat`, 'utf8').split(')').pop()!.trim().split(/\s+/)[19])
+    const record = { pid: child.pid, kind: 'hermes-gateway', argv: ['gateway', 'run'], start_time: startTicks }
+    const pidFile = path.join(home, 'gateway.pid')
+    expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+
+    // Another kind of record, or a reused PID (another incarnation), is no evidence.
+    for (const invalid of [{ ...record, kind: 'hermes-dashboard' }, { ...record, start_time: startTicks + 1 }, { ...record, pid: process.pid }]) {
+      fs.writeFileSync(pidFile, JSON.stringify(invalid))
+      expect(() => localBackendProcess(port, child.pid!, home)).toThrow('found 0')
+    }
+
+    fs.writeFileSync(pidFile, JSON.stringify(record))
+    const backend = localBackendProcess(port, child.pid!, home)
+    expect(backend.pid).toBe(child.pid)
+    expect(backend.ownership).toBe('gateway-owner')
+    // Ownership does not waive the installed-tree provenance check.
+    expect(() => assertBackendOrigin(backend, home, 'bundled')).toThrow('agent-payload')
+
+    // Where the platform hides cwd/env (Windows), the app's report of its root vouches for
+    // the gateway owner its own home names, exactly as for its child, never for a ledger entry.
+    const root = path.join(home, 'hermes-agent')
+    fs.mkdirSync(root)
+
+    const hidden = { pid: child.pid!, parentPid: 1, executable: path.join(home, 'python.exe'),
+      command: `"${path.join(home, 'python.exe')}" "-m" "hermes_cli.main" --profile default gateway run --quiet` }
+
+    expect(() => assertBackendOrigin({ ...hidden, ownership: 'gateway-owner' }, root, 'source', { appReportedRoot: root })).not.toThrow()
+    expect(() => assertBackendOrigin({ ...hidden, ownership: 'gateway-owner' }, root, 'source')).toThrow('source tree')
+    expect(() => assertBackendOrigin({ ...hidden, ownership: 'host-ledger' }, root, 'source', { appReportedRoot: root })).toThrow('source tree')
+  } finally {
+    child.kill()
+    await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) })
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('a platform that cannot read the backend environment proves ownership by the app', (): void => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-owner-origin-'))
 

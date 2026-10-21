@@ -23,9 +23,9 @@ export interface NativeProcess {
   cwd?: string
 }
 
-/** The identified listener, with how it was tied to this app (ancestry or this home's ledger). */
+/** The identified listener, with how it was tied to this app (ancestry, this home's ledger, or this home's gateway owner). */
 export interface BackendProcess extends NativeProcess {
-  ownership: 'child' | 'host-ledger'
+  ownership: 'child' | 'host-ledger' | 'gateway-owner'
 }
 
 /** What the caller already knows about the app that owns this listener. */
@@ -179,6 +179,47 @@ function processStartTime(pid: number): number | null {
   }
 }
 
+const gatewayPidRecord = z.object({ pid: z.number().int().positive(), kind: z.literal('hermes-gateway'), start_time: z.number().nullable().optional() })
+
+/** True unless a recorded `gateway/status.py::_get_process_start_time` fingerprint names another incarnation. */
+function gatewayStartMatches(pid: number, recorded: number | null | undefined): boolean {
+  if (recorded === null || recorded === undefined) {
+    return true
+  }
+
+  if (process.platform === 'linux') {
+    // Same source as the product: field 22 of /proc/<pid>/stat, clock ticks since boot.
+    try { return Number(fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(')').pop()!.trim().split(/\s+/)[19]) === recorded } catch { return false }
+  }
+
+  // Elsewhere the product records the birth epoch in centiseconds; the ledger's 2 s tolerance applies.
+  const started = processStartTime(pid)
+
+  return started !== null && Math.abs(started - recorded / 100) < 2
+}
+
+/**
+ * The gateway owner a home's `gateway.pid` names, while that incarnation lives. Desktop dials this
+ * owner's listener (`hermes gateway ensure` -> `api_origin`, `electron/local-gateway.ts`) and the
+ * owner is detached on purpose (`gateway_runtime_start.py::spawn_unmanaged_gateway`), so it is never
+ * an Electron descendant. A served profile's owner is the machine root's multiplexer.
+ */
+function gatewayOwnerPids(processes: NativeProcess[], homes: string[]): number[] {
+  return [...new Set(homes)].flatMap((home: string): number[] => {
+    let parsed: z.infer<typeof gatewayPidRecord>
+
+    try {
+      parsed = gatewayPidRecord.parse(JSON.parse(fs.readFileSync(path.join(home, 'gateway.pid'), 'utf8')))
+    } catch {
+      return []
+    }
+
+    const live = processes.some((candidate: NativeProcess): boolean => candidate.pid === parsed.pid)
+
+    return live && gatewayStartMatches(parsed.pid, parsed.start_time) ? [parsed.pid] : []
+  })
+}
+
 /** Identify the actual listener, not a healthy helper or a command recorded before spawn. */
 export function localBackendProcess(port: number, electronPid: number, hermesHome?: string): BackendProcess {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -192,12 +233,14 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   // its own child. Registration is only a candidate: the OS listener and the
   // caller's existing installed-tree checks must independently agree.
   let registered: number[] = []
+  let gatewayOwners: number[] = []
 
   if (hermesHome) {
     // The product writes one machine-root ledger for every profile, and the app
     // reads it at its own resolved root (`main.ts` -> `spawnLedgerPath(HERMES_HOME)`,
     // where a `<root>/profiles/<name>` home resolves to `<root>`).
     const ledgerRoot = resolveDesktopHermesHome({ home: os.homedir(), env: { HERMES_HOME: hermesHome } })
+    gatewayOwners = gatewayOwnerPids(processes, [hermesHome, ledgerRoot])
 
     try {
       registered = parseSpawnLedger(fs.readFileSync(path.join(ledgerRoot, SPAWN_LEDGER_FILENAME), 'utf8'))
@@ -218,7 +261,9 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
     } catch { /* Missing/unreadable ledger provides no attachment evidence. */ }
   }
 
-  const candidates = processes.filter(candidate => children.includes(candidate) || registered.includes(candidate.pid))
+  const candidates = processes.filter(candidate => children.includes(candidate) || registered.includes(candidate.pid)
+    || gatewayOwners.includes(candidate.pid))
+
   let pids: number[]
 
   if (process.platform === 'win32') {
@@ -234,10 +279,13 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
   const matches = candidates.filter((child: NativeProcess): boolean => pids.includes(child.pid))
 
   if (matches.length !== 1) {
-    throw new Error(`Expected one Desktop-owned or registered host backend listener on port ${port}; found ${matches.length}`)
+    throw new Error(`Expected one Desktop-owned, ledger-registered or gateway-owner backend listener on port ${port}; found ${matches.length}`)
   }
 
-  const backend: BackendProcess = { ...matches[0], ownership: children.includes(matches[0]) ? 'child' : 'host-ledger' }
+  const ownership: BackendProcess['ownership'] = children.includes(matches[0]) ? 'child'
+    : gatewayOwners.includes(matches[0].pid) ? 'gateway-owner' : 'host-ledger'
+
+  const backend: BackendProcess = { ...matches[0], ownership }
 
   if (process.platform === 'linux') {
     backend.executable = fs.readlinkSync(`/proc/${backend.pid}/exe`)
@@ -262,16 +310,18 @@ export function localBackendProcess(port: number, electronPid: number, hermesHom
 // module-launched backend there can never name its tree in argv (Windows: the venv
 // launcher hands the interpreter over as a system python). When the listener is a
 // descendant of the app, and the caller has already asserted the root that app
-// reported resolving, those two facts together are the evidence. A ledger-registered
-// host backend is not tied to this app by ancestry, so the app's report says nothing
-// about it; it must carry its own argv/env/cwd evidence. Requiring the process
-// evidence to be absent keeps this from loosening a platform that can read one.
+// reported resolving, those two facts together are the evidence. The same holds for
+// the gateway owner the app's own home names in `gateway.pid`: the app started or
+// adopted it through `hermes gateway ensure` from that root, and the chat smoke still
+// checks the commit it runs. A ledger-registered host backend is tied to neither, so
+// it must carry its own argv/env/cwd evidence. Requiring the process evidence to be
+// absent keeps this from loosening a platform that can read one.
 function appVouchesForBackend(backend: BackendProcess, evidence: OriginEvidence,
   sameTree: (value?: string) => boolean): boolean {
   const processEvidenceUnreadable = backend.cwd === undefined
     && backend.pythonPath === undefined && backend.virtualEnv === undefined
 
-  return processEvidenceUnreadable && backend.ownership === 'child'
+  return processEvidenceUnreadable && (backend.ownership === 'child' || backend.ownership === 'gateway-owner')
     && evidence.appReportedRoot !== undefined && sameTree(evidence.appReportedRoot)
 }
 
