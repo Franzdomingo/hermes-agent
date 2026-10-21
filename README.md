@@ -77,7 +77,21 @@ hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
 ```
 
-📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+## Docker Deployment
+
+To run Hermes Agent with the messaging gateway and web dashboard in a single container:
+
+```bash
+HERMES_UID=$(id -u) HERMES_GID=$(id -g) docker compose up -d --remove-orphans
+```
+
+- **Single Container Architecture**: The gateway and web dashboard run in ONE container using the stock image (`nousresearch/hermes-agent:latest`). Running the dashboard in a separate container is not supported because its gateway-liveness check requires a shared PID namespace with the gateway process.
+- **Enabling Dashboard**: `HERMES_DASHBOARD=1` is required to start the supervised s6 dashboard service on port 9119 alongside the gateway.
+- **Authentication**: Dashboard basic auth is configured via `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` and `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` (defaults to `admin`).
+- **Rollback**: To revert to the previous two-container setup if needed:
+  ```bash
+  cp docker-compose.yml.bak-20261016 docker-compose.yml && docker compose up -d --remove-orphans
+  ```
 
 ---
 
@@ -141,6 +155,7 @@ All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes
 | [Contributing](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) | Development setup, PR process, code style |
 | [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands) | All commands and flags |
 | [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference |
+| [Docker Deployment](https://hermes-agent.nousresearch.com/docs/user-guide/docker) | Docker & Compose setup, single-container gateway+dashboard |
 
 ---
 

@@ -82,10 +82,10 @@ The entrypoint starts `hermes dashboard` in the background (running as the non-r
 | `HERMES_DASHBOARD_PORT` | Port for the dashboard HTTP server | `9119` |
 | `HERMES_DASHBOARD_TUI` | Set to `1` to expose the in-browser Chat tab (embedded `hermes --tui` via PTY/WebSocket) | *(unset)* |
 
-The default `HERMES_DASHBOARD_HOST=0.0.0.0` is required for the host to reach the dashboard through the published port; the entrypoint automatically passes `--insecure` to `hermes dashboard` in that case. Override to `127.0.0.1` if you want to restrict the dashboard to in-container access only (e.g. behind a reverse proxy in a sidecar).
+The default `HERMES_DASHBOARD_HOST=0.0.0.0` is required for the host to reach the dashboard through the published port. When bound to a non-loopback address, an auth provider is required (e.g. set `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` and `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`). Override to `127.0.0.1` if you want to restrict the dashboard to in-container access only (e.g. behind a reverse proxy in a sidecar).
 
 :::note
-The dashboard side-process is **not supervised** — if it crashes, it stays down until the container restarts. Running it as a separate container is not supported: the dashboard's gateway-liveness detection requires a shared PID namespace with the gateway process.
+The dashboard is supervised alongside the gateway via s6-rc when `HERMES_DASHBOARD=1` is set. Running the dashboard in a separate container is **not supported**: the dashboard's gateway-liveness detection requires a shared PID namespace with the gateway process.
 :::
 
 ## Running interactively (CLI chat)
@@ -218,6 +218,8 @@ services:
       - ~/.hermes:/opt/data
     environment:
       - HERMES_DASHBOARD=1
+      - HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
+      - HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD}
       # Uncomment to forward specific env vars instead of using .env file:
       # - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # - OPENAI_API_KEY=${OPENAI_API_KEY}
@@ -229,7 +231,9 @@ services:
           cpus: "2.0"
 ```
 
-Start with `docker compose up -d` and view logs with `docker compose logs -f`. Dashboard output is prefixed with `[dashboard]` so it's easy to filter from gateway logs.
+Running both the gateway and the dashboard in a single container ensures they share the same PID namespace, allowing the dashboard to accurately monitor the gateway's liveness and dispatch controls through s6. Running the dashboard in a separate container is not supported.
+
+Start with `docker compose up -d --remove-orphans` and view logs with `docker compose logs -f`. Dashboard output is prefixed with `[dashboard]` so it's easy to filter from gateway logs. To roll back to a backup compose file: `cp docker-compose.yml.bak-<date> docker-compose.yml && docker compose up -d --remove-orphans`.
 
 ## Resource limits
 
