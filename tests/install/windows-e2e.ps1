@@ -171,6 +171,10 @@ function Start-JourneyChat {
 }
 
 function Invoke-DesktopCheckpoint([string]$ChatPhase, [string]$Commit, [string]$Method) {
+    # Every checkpoint chats through the journey mock. Without it the smoke starts a private mock,
+    # and the detached gateway that checkpoint leaves running keeps that dead URL into later steps;
+    # the journey mock's URL file lets a later step's mock rebind the same port.
+    Start-JourneyChat
     $script:ChatFailure = $true
     $prevEap = $ErrorActionPreference
     try {
