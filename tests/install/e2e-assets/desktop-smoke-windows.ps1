@@ -3,8 +3,13 @@
 function Start-DesktopJourneyMock([string]$Node, [string]$Assets, [string]$Work, [string]$HermesHome, [string]$Out) {
     New-Item -ItemType Directory -Path $Out -Force | Out-Null
     $urlFile = Join-Path $Work 'chat-mock-url'
+    # An earlier step's mock died with that step; the detached gateway did not, and it
+    # kept the provider URL it read at boot. Rebind that URL's port (see mock-provider.mjs).
+    $priorUrl = if (Test-Path -LiteralPath $urlFile) { (Get-Content -LiteralPath $urlFile -Raw).Trim() } else { '' }
     Remove-Item -LiteralPath $urlFile -Force -ErrorAction SilentlyContinue
-    $mock = Start-Process -FilePath $Node -ArgumentList @(('"' + (Join-Path $Assets 'mock-provider.mjs') + '"'), ('"' + $urlFile + '"')) `
+    $mockArgs = @(('"' + (Join-Path $Assets 'mock-provider.mjs') + '"'), ('"' + $urlFile + '"'))
+    if ($priorUrl) { $mockArgs += ('"' + $priorUrl + '"') }
+    $mock = Start-Process -FilePath $Node -ArgumentList $mockArgs `
         -PassThru -RedirectStandardOutput (Join-Path $Out 'chat-mock.log') -RedirectStandardError (Join-Path $Out 'chat-mock-error.log')
     try {
         $deadline = (Get-Date).AddSeconds(30)

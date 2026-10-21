@@ -15,6 +15,17 @@ import { assertBackendOrigin, localBackendProcess, readBundledBundleEnv, readIns
 import { writeEnvFile, writeMockProviderConfig } from './mock-provider-config.ts'
 import { MOCK_REPLY, startMockServer } from './mock-server.ts'
 
+test('a later CI step\'s mock rebinds the dead mock\'s port, so a gateway that outlived it still answers', async (): Promise<void> => {
+  // The detached gateway froze `http://127.0.0.1:<port>` at boot; the step that started that mock is gone.
+  const earlier = await startMockServer()
+  await earlier.close()
+  const later = await startMockServer({ port: earlier.port })
+
+  try {
+    expect(later.url).toBe(earlier.url)
+  } finally { await later.close() }
+})
+
 test('one server owns inference and a fresh, per-server prompt witness', async (): Promise<void> => {
   const first = await startMockServer()
   const second = await startMockServer()
